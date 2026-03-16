@@ -13,6 +13,7 @@ import (
 	"github.com/maximhq/bifrost/core/providers/gemini"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/kvstore"
+	"github.com/maximhq/bifrost/framework/modelcatalog"
 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
 )
@@ -28,6 +29,190 @@ var availableIntegrations = []string{
 	"bedrock",
 	"pydantic",
 	"cohere",
+}
+
+type usageHeaderPayload struct {
+	InputTokens  int     `json:"input_tokens"`
+	OutputTokens int     `json:"output_tokens"`
+	TotalTokens  int     `json:"total_tokens"`
+	Cost         float64 `json:"cost"`
+}
+
+type modelCatalogProvider interface {
+	GetModelCatalog() *modelcatalog.ModelCatalog
+}
+
+func (g *GenericRouter) getModelCatalog() *modelcatalog.ModelCatalog {
+	if provider, ok := g.handlerStore.(modelCatalogProvider); ok {
+		return provider.GetModelCatalog()
+	}
+
+	return nil
+}
+
+func (g *GenericRouter) applyUsageHeader(ctx *fasthttp.RequestCtx, routeType RouteConfigType, data interface{}) {
+	if routeType != RouteConfigTypeGenAI {
+		return
+	}
+
+	payload, ok := buildUsageHeaderPayload(data, g.getModelCatalog())
+	if !ok {
+		return
+	}
+
+	encoded, err := sonic.Marshal(payload)
+	if err != nil {
+		if g.logger != nil {
+			g.logger.Warn("failed to marshal X-Usage header", "err", err)
+		}
+		return
+	}
+
+	ctx.Response.Header.Set("X-Usage", string(encoded))
+}
+
+func buildUsageHeaderPayload(data interface{}, catalog *modelcatalog.ModelCatalog) (*usageHeaderPayload, bool) {
+	var payload *usageHeaderPayload
+	var response *schemas.BifrostResponse
+
+	switch resp := data.(type) {
+	case *schemas.BifrostTextCompletionResponse:
+		payload = llmUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{TextCompletionResponse: resp}
+	case *schemas.BifrostChatResponse:
+		payload = llmUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{ChatResponse: resp}
+	case *schemas.BifrostResponsesResponse:
+		payload = responsesUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{ResponsesResponse: resp}
+	case *schemas.BifrostEmbeddingResponse:
+		payload = llmUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{EmbeddingResponse: resp}
+	case *schemas.BifrostRerankResponse:
+		payload = llmUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{RerankResponse: resp}
+	case *schemas.BifrostSpeechResponse:
+		payload = speechUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{SpeechResponse: resp}
+	case *schemas.BifrostTranscriptionResponse:
+		payload = transcriptionUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{TranscriptionResponse: resp}
+	case *schemas.BifrostImageGenerationResponse:
+		payload = imageUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{ImageGenerationResponse: resp}
+	case *schemas.BifrostCountTokensResponse:
+		payload = countTokensUsageHeaderPayload(resp)
+	default:
+		return nil, false
+	}
+
+	if payload == nil {
+		return nil, false
+	}
+
+	if catalog != nil && response != nil {
+		payload.Cost = catalog.CalculateCost(response)
+	}
+
+	return payload, true
+}
+
+func llmUsageHeaderPayload(usage *schemas.BifrostLLMUsage) *usageHeaderPayload {
+	if usage == nil {
+		return nil
+	}
+
+	payload := &usageHeaderPayload{
+		InputTokens:  usage.PromptTokens,
+		OutputTokens: usage.CompletionTokens,
+		TotalTokens:  usage.TotalTokens,
+	}
+	if usage.Cost != nil {
+		payload.Cost = usage.Cost.TotalCost
+	}
+
+	return payload
+}
+
+func responsesUsageHeaderPayload(usage *schemas.ResponsesResponseUsage) *usageHeaderPayload {
+	if usage == nil {
+		return nil
+	}
+
+	payload := &usageHeaderPayload{
+		InputTokens:  usage.InputTokens,
+		OutputTokens: usage.OutputTokens,
+		TotalTokens:  usage.TotalTokens,
+	}
+	if usage.Cost != nil {
+		payload.Cost = usage.Cost.TotalCost
+	}
+
+	return payload
+}
+
+func speechUsageHeaderPayload(usage *schemas.SpeechUsage) *usageHeaderPayload {
+	if usage == nil {
+		return nil
+	}
+
+	return &usageHeaderPayload{
+		InputTokens:  usage.InputTokens,
+		OutputTokens: usage.OutputTokens,
+		TotalTokens:  usage.TotalTokens,
+	}
+}
+
+func transcriptionUsageHeaderPayload(usage *schemas.TranscriptionUsage) *usageHeaderPayload {
+	if usage == nil {
+		return nil
+	}
+
+	payload := &usageHeaderPayload{}
+	if usage.InputTokens != nil {
+		payload.InputTokens = *usage.InputTokens
+	}
+	if usage.OutputTokens != nil {
+		payload.OutputTokens = *usage.OutputTokens
+	}
+	if usage.TotalTokens != nil {
+		payload.TotalTokens = *usage.TotalTokens
+	} else {
+		payload.TotalTokens = payload.InputTokens + payload.OutputTokens
+	}
+
+	return payload
+}
+
+func imageUsageHeaderPayload(usage *schemas.ImageUsage) *usageHeaderPayload {
+	if usage == nil {
+		return nil
+	}
+
+	return &usageHeaderPayload{
+		InputTokens:  usage.InputTokens,
+		OutputTokens: usage.OutputTokens,
+		TotalTokens:  usage.TotalTokens,
+	}
+}
+
+func countTokensUsageHeaderPayload(resp *schemas.BifrostCountTokensResponse) *usageHeaderPayload {
+	if resp == nil {
+		return nil
+	}
+
+	payload := &usageHeaderPayload{
+		InputTokens: resp.InputTokens,
+		TotalTokens: resp.InputTokens,
+	}
+	if resp.OutputTokens != nil {
+		payload.OutputTokens = *resp.OutputTokens
+	}
+	if resp.TotalTokens != nil {
+		payload.TotalTokens = *resp.TotalTokens
+	}
+
+	return payload
 }
 
 // newBifrostError wraps a standard error into a BifrostError with IsBifrostError set to false.
