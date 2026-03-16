@@ -5,7 +5,6 @@ package handlers
 import (
 	"bufio"
 	"context"
-
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,8 +18,8 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/fasthttp/router"
 	bifrost "github.com/maximhq/bifrost/core"
-
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/modelcatalog"
 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
 )
@@ -37,6 +36,153 @@ func forwardProviderHeaders(ctx *fasthttp.RequestCtx, headers map[string]string)
 func forwardProviderHeadersFromContext(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext) {
 	if headers, ok := bifrostCtx.Value(schemas.BifrostContextKeyProviderResponseHeaders).(map[string]string); ok {
 		forwardProviderHeaders(ctx, headers)
+	}
+}
+
+type usageHeaderPayload struct {
+	InputTokens  int     `json:"input_tokens"`
+	OutputTokens int     `json:"output_tokens"`
+	TotalTokens  int     `json:"total_tokens"`
+	Cost         float64 `json:"cost"`
+}
+
+func (h *CompletionHandler) sendJSONWithUsage(ctx *fasthttp.RequestCtx, data interface{}) {
+	applyUsageHeader(ctx, data, h.config.ModelCatalog)
+	SendJSON(ctx, data)
+}
+
+func applyUsageHeader(ctx *fasthttp.RequestCtx, data interface{}, catalog *modelcatalog.ModelCatalog) {
+	payload, ok := buildUsageHeaderPayload(data, catalog)
+	if !ok {
+		return
+	}
+
+	encoded, err := sonic.Marshal(payload)
+	if err != nil {
+		logger.Warn("Failed to marshal X-Usage header: %v", err)
+		return
+	}
+
+	ctx.Response.Header.Set("X-Usage", string(encoded))
+}
+
+func buildUsageHeaderPayload(data interface{}, catalog *modelcatalog.ModelCatalog) (*usageHeaderPayload, bool) {
+	var payload *usageHeaderPayload
+	var response *schemas.BifrostResponse
+
+	switch resp := data.(type) {
+	case *schemas.BifrostTextCompletionResponse:
+		payload = llmUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{TextCompletionResponse: resp}
+	case *schemas.BifrostChatResponse:
+		payload = llmUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{ChatResponse: resp}
+	case *schemas.BifrostResponsesResponse:
+		payload = responsesUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{ResponsesResponse: resp}
+	case *schemas.BifrostEmbeddingResponse:
+		payload = llmUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{EmbeddingResponse: resp}
+	case *schemas.BifrostRerankResponse:
+		payload = llmUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{RerankResponse: resp}
+	case *schemas.BifrostSpeechResponse:
+		payload = speechUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{SpeechResponse: resp}
+	case *schemas.BifrostTranscriptionResponse:
+		payload = transcriptionUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{TranscriptionResponse: resp}
+	case *schemas.BifrostImageGenerationResponse:
+		payload = imageUsageHeaderPayload(resp.Usage)
+		response = &schemas.BifrostResponse{ImageGenerationResponse: resp}
+	default:
+		return nil, false
+	}
+
+	if payload == nil {
+		return nil, false
+	}
+
+	if catalog != nil && response != nil {
+		payload.Cost = catalog.CalculateCost(response)
+	}
+
+	return payload, true
+}
+
+func llmUsageHeaderPayload(usage *schemas.BifrostLLMUsage) *usageHeaderPayload {
+	if usage == nil {
+		return nil
+	}
+
+	payload := &usageHeaderPayload{
+		InputTokens:  usage.PromptTokens,
+		OutputTokens: usage.CompletionTokens,
+		TotalTokens:  usage.TotalTokens,
+	}
+	if usage.Cost != nil {
+		payload.Cost = usage.Cost.TotalCost
+	}
+	return payload
+}
+
+func responsesUsageHeaderPayload(usage *schemas.ResponsesResponseUsage) *usageHeaderPayload {
+	if usage == nil {
+		return nil
+	}
+
+	payload := &usageHeaderPayload{
+		InputTokens:  usage.InputTokens,
+		OutputTokens: usage.OutputTokens,
+		TotalTokens:  usage.TotalTokens,
+	}
+	if usage.Cost != nil {
+		payload.Cost = usage.Cost.TotalCost
+	}
+	return payload
+}
+
+func speechUsageHeaderPayload(usage *schemas.SpeechUsage) *usageHeaderPayload {
+	if usage == nil {
+		return nil
+	}
+
+	return &usageHeaderPayload{
+		InputTokens:  usage.InputTokens,
+		OutputTokens: usage.OutputTokens,
+		TotalTokens:  usage.TotalTokens,
+	}
+}
+
+func transcriptionUsageHeaderPayload(usage *schemas.TranscriptionUsage) *usageHeaderPayload {
+	if usage == nil {
+		return nil
+	}
+
+	payload := &usageHeaderPayload{}
+	if usage.InputTokens != nil {
+		payload.InputTokens = *usage.InputTokens
+	}
+	if usage.OutputTokens != nil {
+		payload.OutputTokens = *usage.OutputTokens
+	}
+	if usage.TotalTokens != nil {
+		payload.TotalTokens = *usage.TotalTokens
+	} else {
+		payload.TotalTokens = payload.InputTokens + payload.OutputTokens
+	}
+	return payload
+}
+
+func imageUsageHeaderPayload(usage *schemas.ImageUsage) *usageHeaderPayload {
+	if usage == nil {
+		return nil
+	}
+
+	return &usageHeaderPayload{
+		InputTokens:  usage.InputTokens,
+		OutputTokens: usage.OutputTokens,
+		TotalTokens:  usage.TotalTokens,
 	}
 }
 
@@ -839,7 +985,7 @@ func (h *CompletionHandler) textCompletion(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	// Send successful response
-	SendJSON(ctx, resp)
+	h.sendJSONWithUsage(ctx, resp)
 }
 
 // prepareChatCompletionRequest prepares a BifrostChatRequest from a ChatRequest
@@ -931,6 +1077,7 @@ func (h *CompletionHandler) chatCompletion(ctx *fasthttp.RequestCtx) {
 	}
 	defer cancel() // Ensure cleanup on function exit
 	// Complete the request
+
 	resp, bifrostErr := h.client.ChatCompletionRequest(bifrostCtx, bifrostChatReq)
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
@@ -945,7 +1092,7 @@ func (h *CompletionHandler) chatCompletion(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	// Send successful response
-	SendJSON(ctx, resp)
+	h.sendJSONWithUsage(ctx, resp)
 }
 
 // prepareResponsesRequest prepares a BifrostResponsesRequest from a ResponsesRequest
@@ -1041,7 +1188,7 @@ func (h *CompletionHandler) responses(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	// Send successful response
-	SendJSON(ctx, resp)
+	h.sendJSONWithUsage(ctx, resp)
 }
 
 // prepareEmbeddingRequest prepares a BifrostEmbeddingRequest from the HTTP request body
@@ -1109,7 +1256,7 @@ func (h *CompletionHandler) embeddings(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	// Send successful response
-	SendJSON(ctx, resp)
+	h.sendJSONWithUsage(ctx, resp)
 }
 
 // prepareRerankRequest prepares a BifrostRerankRequest from the HTTP request body
@@ -1203,7 +1350,7 @@ func (h *CompletionHandler) rerank(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	// Send successful response
-	SendJSON(ctx, resp)
+	h.sendJSONWithUsage(ctx, resp)
 }
 
 // prepareSpeechRequest prepares a BifrostSpeechRequest from the HTTP request body
@@ -1293,7 +1440,7 @@ func (h *CompletionHandler) speech(ctx *fasthttp.RequestCtx) {
 
 	if bifrostSpeechReq.Provider == schemas.Elevenlabs && hasTimestamps {
 		ctx.Response.Header.Set("Content-Type", "application/json")
-		SendJSON(ctx, resp)
+		h.sendJSONWithUsage(ctx, resp)
 		return
 	}
 
@@ -1302,6 +1449,7 @@ func (h *CompletionHandler) speech(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	applyUsageHeader(ctx, resp, h.config.ModelCatalog)
 	ctx.Response.Header.Set("Content-Type", "audio/mpeg")
 	ctx.Response.Header.Set("Content-Disposition", "attachment; filename=speech.mp3")
 	ctx.Response.Header.Set("Content-Length", strconv.Itoa(len(resp.Audio)))
@@ -1409,7 +1557,7 @@ func (h *CompletionHandler) transcription(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	// Send successful response
-	SendJSON(ctx, resp)
+	h.sendJSONWithUsage(ctx, resp)
 }
 
 // countTokens handles POST /v1/responses/input_tokens - Process count tokens requests
@@ -1808,7 +1956,7 @@ func (h *CompletionHandler) imageGeneration(ctx *fasthttp.RequestCtx) {
 	if streamLargeResponseIfActive(ctx, bifrostCtx) {
 		return
 	}
-	SendJSON(ctx, resp)
+	h.sendJSONWithUsage(ctx, resp)
 }
 
 // handleStreamingImageGeneration handles streaming image generation requests using Server-Sent Events (SSE)
@@ -2020,7 +2168,7 @@ func (h *CompletionHandler) imageEdit(ctx *fasthttp.RequestCtx) {
 	if streamLargeResponseIfActive(ctx, bifrostCtx) {
 		return
 	}
-	SendJSON(ctx, resp)
+	h.sendJSONWithUsage(ctx, resp)
 }
 
 // handleStreamingImageEditRequest handles streaming image edit requests using Server-Sent Events (SSE)
@@ -2157,7 +2305,7 @@ func (h *CompletionHandler) imageVariation(ctx *fasthttp.RequestCtx) {
 	if streamLargeResponseIfActive(ctx, bifrostCtx) {
 		return
 	}
-	SendJSON(ctx, resp)
+	h.sendJSONWithUsage(ctx, resp)
 }
 
 // videoGeneration handles POST /v1/videos - Processes video generation requests
